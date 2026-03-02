@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generic MCP server eval runner using DeepEval.
 
-Takes a server config JSON and eval cases YAML, runs the agent on each case,
-scores with GEval via OpenRouter, and outputs JSON results.
+Runs all eval cases in parallel — each case gets its own MCP server
+subprocess (stdio) or connects to the same URL (http).
 
 Usage:
     python run_evals.py \
@@ -74,23 +74,64 @@ def create_llm(model: str, temperature: float = 0):
     )
 
 
-def build_server_config(server_config_json: str) -> dict:
-    """Parse server config JSON and build MCPClient config."""
+def _parse_server_config(server_config_json: str) -> dict:
+    """Parse server config JSON with sensible defaults for MCP subprocess."""
     config = json.loads(server_config_json)
-
-    # If the config has "env", merge parent env vars into it
-    # so DB passwords etc. get passed through to the subprocess
     if "env" not in config:
         config["env"] = {}
-
-    # Always suppress noisy MCP logs
     config["env"].setdefault("MCP_USE_ANONYMIZED_TELEMETRY", "false")
     config["env"].setdefault("MCP_USE_DEBUG", "0")
     config["env"].setdefault("DEBUG", "0")
     config["env"].setdefault("SHOW_INSPECTOR_LOGS", "false")
     config["env"].setdefault("PRETTY_PRINT_JSONRPC", "false")
+    return config
 
-    return {"mcpServers": {"target": config}}
+
+async def _run_single_eval(
+    server_config: dict,
+    case: dict,
+    model_name: str,
+    prompt_name: str,
+    system_prompt: str,
+    max_steps: int,
+    index: int,
+    total: int,
+) -> tuple[LLMTestCase, dict]:
+    """Run a single eval case with its own MCP client."""
+    case_id = case["id"]
+    print(f"[{index}/{total}] {case_id} | {model_name} | {prompt_name}", file=sys.stderr)
+
+    client = MCPClient({"mcpServers": {"target": server_config}})
+    await client.create_session("target")
+
+    t0 = time.monotonic()
+    try:
+        agent = MCPAgent(
+            llm=create_llm(model_name), client=client,
+            max_steps=max_steps, system_prompt=system_prompt,
+            memory_enabled=False,
+        )
+        response = await agent.run(case["prompt"]) or ""
+    except Exception as e:
+        print(f"  [{case_id}] ERROR: {e}", file=sys.stderr)
+        response = f"[Agent error: {e}]"
+    finally:
+        await client.close_all_sessions()
+
+    elapsed = time.monotonic() - t0
+    print(f"  [{case_id}] {elapsed:.1f}s", file=sys.stderr)
+
+    tc = LLMTestCase(
+        input=case["prompt"],
+        actual_output=response,
+        additional_metadata={
+            "case_id": case_id,
+            "model": model_name,
+            "prompt_name": prompt_name,
+            "duration_s": round(elapsed, 1),
+        },
+    )
+    return tc, case
 
 
 async def run_evals(
@@ -98,6 +139,7 @@ async def run_evals(
     eval_cases_path: str,
     case_filter: str | None = None,
     max_steps: int = 30,
+    parallel: bool = True,
 ) -> list[dict]:
     config = load_eval_cases(eval_cases_path)
     cases = config["cases"]
@@ -107,56 +149,34 @@ async def run_evals(
     if case_filter:
         cases = [c for c in cases if case_filter in c["id"]]
 
-    mcp_config = build_server_config(server_config_json)
-    client = MCPClient(mcp_config)
-    server_name = list(mcp_config["mcpServers"].keys())[0]
-    await client.create_session(server_name)
+    server_config = _parse_server_config(server_config_json)
 
-    test_cases: list[LLMTestCase] = []
-    case_configs: list[dict] = []
-    total = len(cases) * len(models) * len(prompts)
+    # Build list of all eval coroutines
+    coros = []
     n = 0
+    total = len(cases) * len(models) * len(prompts)
+    for case in cases:
+        for model_name in models:
+            for prompt_name, system_prompt in prompts.items():
+                n += 1
+                coros.append(_run_single_eval(
+                    server_config, case, model_name, prompt_name,
+                    system_prompt, max_steps, n, total,
+                ))
 
-    try:
-        for case in cases:
-            for model_name in models:
-                for prompt_name, system_prompt in prompts.items():
-                    n += 1
-                    print(f"[{n}/{total}] {case['id']} | {model_name} | {prompt_name}", file=sys.stderr)
-                    t0 = time.monotonic()
-                    try:
-                        agent = MCPAgent(
-                            llm=create_llm(model_name), client=client,
-                            max_steps=max_steps, system_prompt=system_prompt,
-                            memory_enabled=False,
-                        )
-                        response = await agent.run(case["prompt"]) or ""
-                    except Exception as e:
-                        print(f"  ERROR: {e}", file=sys.stderr)
-                        response = f"[Agent error: {e}]"
-                    elapsed = time.monotonic() - t0
-                    print(f"  {elapsed:.1f}s", file=sys.stderr)
+    if parallel:
+        print(f"Running {total} evals in parallel...\n", file=sys.stderr)
+        results_pairs = await asyncio.gather(*coros)
+    else:
+        print(f"Running {total} evals sequentially...\n", file=sys.stderr)
+        results_pairs = [await c for c in coros]
 
-                    test_cases.append(LLMTestCase(
-                        input=case["prompt"],
-                        actual_output=response,
-                        additional_metadata={
-                            "case_id": case["id"],
-                            "model": model_name,
-                            "prompt_name": prompt_name,
-                            "duration_s": round(elapsed, 1),
-                        },
-                    ))
-                    case_configs.append(case)
-    finally:
-        await client.close_all_sessions()
-
-    # Score with GEval
-    print(f"\nScoring {len(test_cases)} results with DeepEval GEval...\n", file=sys.stderr)
+    # Score each with GEval
+    print(f"\nScoring {len(results_pairs)} results with DeepEval GEval...\n", file=sys.stderr)
     judge = create_judge(config)
     all_results = []
 
-    for tc, case in zip(test_cases, case_configs):
+    for tc, case in results_pairs:
         metric = GEval(
             name="Response Quality",
             criteria=case["rubric"].strip(),
@@ -195,11 +215,13 @@ def main():
     parser.add_argument("--filter", help="Filter cases by id substring")
     parser.add_argument("--output", default="eval-results.json", help="JSON output path")
     parser.add_argument("--max-steps", type=int, default=30, help="Max agent steps per case")
+    parser.add_argument("--parallel", action="store_true", default=True, help="Run evals in parallel")
+    parser.add_argument("--no-parallel", dest="parallel", action="store_false", help="Run evals sequentially")
     args = parser.parse_args()
 
     t_start = time.monotonic()
     results = asyncio.run(run_evals(
-        args.server_config, args.eval_cases, args.filter, args.max_steps,
+        args.server_config, args.eval_cases, args.filter, args.max_steps, args.parallel,
     ))
     total_time = time.monotonic() - t_start
 

@@ -25,6 +25,10 @@ inputs:
     description: "Max agent steps per eval case"
     required: false
     default: "30"
+  parallel:
+    description: "Run eval cases in parallel (each gets its own server instance)"
+    required: false
+    default: "true"
 
 outputs:
   results_json:
@@ -79,10 +83,12 @@ runs:
         EVAL_CASES: ${{ inputs.eval_cases }}
         EVAL_FILTER: ${{ inputs.filter }}
         EVAL_MAX_STEPS: ${{ inputs.max_steps }}
+        EVAL_PARALLEL: ${{ inputs.parallel }}
       run: |
         set -o pipefail
         ARGS=""
         [ -n "$EVAL_FILTER" ] && ARGS="--filter $EVAL_FILTER"
+        [ "$EVAL_PARALLEL" = "true" ] && ARGS="$ARGS --parallel"
         python ${{ github.action_path }}/run_evals.py \
           --server-config "$SERVER_CONFIG" \
           --eval-cases "$EVAL_CASES" \

@@ -93,7 +93,9 @@ def generate_markdown(results: list[dict]) -> str:
         judge = next((m for m in r["metrics"]), None)
         score_val = judge["score"] if judge and judge["score"] is not None else None
         badge = _score_badge(score_val)
-        query = (r.get("input") or "").replace("|", "\\|")
+        query_text = (r.get("input") or "").replace("|", "\\|").replace("\n", " ")
+        query_preview = query_text[:40] + "..." if len(query_text) > 40 else query_text
+        query = f"<details><summary>{query_preview}</summary>{query_text}</details>"
 
         _, model_name, logo_url = _parse_model(r.get("model", ""))
         provider_cell = _provider_img(logo_url)

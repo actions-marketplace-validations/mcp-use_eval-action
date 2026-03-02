@@ -95,15 +95,14 @@ runs:
           --max-steps "$EVAL_MAX_STEPS" \
           $ARGS \
           --output eval-results.json \
-          2>&1 | tee eval-log.txt
+          2>&1 | tee eval-log.txt && EVAL_EXIT=0 || EVAL_EXIT=$?
         echo "results_json=eval-results.json" >> "$GITHUB_OUTPUT"
-        echo "passed=true" >> "$GITHUB_OUTPUT"
-
-    - name: Mark as failed if evals failed
-      if: failure()
-      id: mark_failed
-      shell: bash
-      run: echo "passed=false" >> "$GITHUB_OUTPUT"
+        if [ "$EVAL_EXIT" -eq 0 ]; then
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+        fi
+        exit $EVAL_EXIT
 
     - name: Generate report
       id: report
